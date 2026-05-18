@@ -14,16 +14,15 @@ import json
 import sys
 import time
 
-from vllm_cuda_ckpt.api import CudaCheckpointAPI
-from vllm_cuda_ckpt.discover import discover_cuda_pids, find_vllm_server
-from concurrent.futures import ThreadPoolExecutor
+from cuda_checkpoint import CudaCheckpointAPI, MultiGPUCheckpointer, discover_cuda_pids
+from cuda_checkpoint.discover import find_process_by_name
 
 
 def _resolve_pid(args) -> int:
     if args.pid:
         return args.pid
     try:
-        pid = find_vllm_server()
+        pid = find_process_by_name("vllm.entrypoints.openai.api_server")
         print(f"Auto-discovered vllm serve PID: {pid}")
         return pid
     except RuntimeError as e:
@@ -51,33 +50,6 @@ def _query_server(port: int, prompt: str, model: str, max_tokens: int = 32) -> s
     return r.json()["choices"][0]["text"].strip()
 
 
-def _do_checkpoint(api: CudaCheckpointAPI, pids: list[int], parallel: bool) -> float:
-    for pid in pids:
-        api.lock(pid)
-    t0 = time.perf_counter()
-    if parallel and len(pids) > 1:
-        with ThreadPoolExecutor(max_workers=len(pids)) as ex:
-            list(ex.map(api.checkpoint, pids))
-    else:
-        for pid in pids:
-            api.checkpoint(pid)
-    return time.perf_counter() - t0
-
-
-def _do_restore(api: CudaCheckpointAPI, pids: list[int], parallel: bool) -> float:
-    t0 = time.perf_counter()
-    if parallel and len(pids) > 1:
-        with ThreadPoolExecutor(max_workers=len(pids)) as ex:
-            list(ex.map(api.restore, pids))
-    else:
-        for pid in pids:
-            api.restore(pid)
-    rest_time = time.perf_counter() - t0
-    for pid in pids:
-        api.unlock(pid)
-    return rest_time
-
-
 def cmd_discover(args):
     pids = discover_cuda_pids(_resolve_pid(args))
     print(f"CUDA PIDs: {pids} ({len(pids)} total)")
@@ -86,49 +58,47 @@ def cmd_discover(args):
 
 
 def cmd_checkpoint(args):
-    api = CudaCheckpointAPI()
     pids = discover_cuda_pids(_resolve_pid(args))
     print(f"CUDA PIDs: {pids} ({len(pids)} total)")
     if not pids:
         print("ERROR: No CUDA-active PIDs found", file=sys.stderr)
         sys.exit(1)
-    ckpt_time = _do_checkpoint(api, pids, parallel=not args.sequential)
-    print(f"Checkpoint: {ckpt_time:.2f}s ({len(pids)} PIDs)")
+    mgpu = MultiGPUCheckpointer(pids, parallel=not args.sequential)
+    result = mgpu.checkpoint()
+    print(f"Checkpoint: {result['checkpoint_time']:.2f}s ({len(pids)} PIDs)")
     if args.json:
-        print(json.dumps({"action": "checkpoint", "pids": pids, "time": ckpt_time}))
+        print(json.dumps({"action": "checkpoint", "pids": pids, **result}))
 
 
 def cmd_restore(args):
-    api = CudaCheckpointAPI()
     pids = discover_cuda_pids(_resolve_pid(args))
     print(f"CUDA PIDs: {pids} ({len(pids)} total)")
     if not pids:
         print("ERROR: No CUDA-active PIDs found", file=sys.stderr)
         sys.exit(1)
-    rest_time = _do_restore(api, pids, parallel=not args.sequential)
-    result = {"action": "restore", "pids": pids, "time": rest_time}
-    print(f"Restore: {rest_time:.2f}s ({len(pids)} PIDs)")
+    mgpu = MultiGPUCheckpointer(pids, parallel=not args.sequential)
+    result = mgpu.restore()
+    print(f"Restore: {result['restore_time']:.2f}s ({len(pids)} PIDs)")
     if args.port:
         healthy = _check_health(args.port, timeout=30)
         result["healthy"] = healthy
         print(f"Health: {'OK' if healthy else 'FAIL'}")
     if args.json:
-        print(json.dumps(result))
+        print(json.dumps({"action": "restore", "pids": pids, **result}))
 
 
 def cmd_cycle(args):
-    api = CudaCheckpointAPI()
     pids = discover_cuda_pids(_resolve_pid(args))
     print(f"CUDA PIDs: {pids} ({len(pids)} total)")
     if not pids:
         print("ERROR: No CUDA-active PIDs found", file=sys.stderr)
         sys.exit(1)
-    parallel = not args.sequential
-    ckpt_time = _do_checkpoint(api, pids, parallel=parallel)
-    print(f"Checkpoint: {ckpt_time:.2f}s")
-    rest_time = _do_restore(api, pids, parallel=parallel)
-    print(f"Restore: {rest_time:.2f}s")
-    result = {"action": "cycle", "pids": pids, "checkpoint_time": ckpt_time, "restore_time": rest_time}
+    mgpu = MultiGPUCheckpointer(pids, parallel=not args.sequential)
+    ckpt = mgpu.checkpoint()
+    print(f"Checkpoint: {ckpt['checkpoint_time']:.2f}s")
+    rest = mgpu.restore()
+    print(f"Restore: {rest['restore_time']:.2f}s")
+    result = {**ckpt, **rest}
     if args.port:
         healthy = _check_health(args.port, timeout=30)
         result["healthy"] = healthy
@@ -138,24 +108,21 @@ def cmd_cycle(args):
             text = _query_server(args.port, "The capital of France is", args.model)
             infer_time = time.perf_counter() - t0
             result["inference_time"] = infer_time
-            result["cold_start"] = rest_time + infer_time
+            result["cold_start"] = rest["restore_time"] + infer_time
             result["response"] = text[:80]
             print(f"Cold start: {result['cold_start']:.2f}s")
     if args.json:
-        print(json.dumps(result))
+        print(json.dumps({"action": "cycle", "pids": pids, **result}))
 
 
 def cmd_watch(args):
     import signal
 
-    api = CudaCheckpointAPI()
     interval = args.interval
     port = args.port
-    model = args.model
 
     print(f"Watch mode: checkpoint every {interval}s", flush=True)
 
-    # Wait for server to be ready
     if port:
         print(f"Waiting for server on port {port}...", flush=True)
         for _ in range(300):
@@ -174,15 +141,14 @@ def cmd_watch(args):
         print("ERROR: No CUDA-active PIDs found", file=sys.stderr)
         sys.exit(1)
 
-    parallel = not args.sequential
+    mgpu = MultiGPUCheckpointer(pids, parallel=not args.sequential)
     stop_event = False
-    last_ckpt = None
 
     def handle_sigterm(signum, frame):
         nonlocal stop_event
         print("\nSIGTERM received — final checkpoint...", flush=True)
         try:
-            _do_checkpoint(api, pids, parallel)
+            mgpu.checkpoint()
             print("Final checkpoint OK", flush=True)
         except Exception as e:
             print(f"Final checkpoint failed: {e}", file=sys.stderr)
@@ -194,13 +160,14 @@ def cmd_watch(args):
     cycle_count = 0
     while not stop_event:
         try:
-            ckpt_time = _do_checkpoint(api, pids, parallel)
-            rest_time = _do_restore(api, pids, parallel)
+            ckpt = mgpu.checkpoint()
+            rest = mgpu.restore()
             cycle_count += 1
-            last_ckpt = time.time()
 
-            status = {"cycle": cycle_count, "checkpoint": round(ckpt_time, 3),
-                      "restore": round(rest_time, 3), "timestamp": last_ckpt}
+            status = {"cycle": cycle_count,
+                      "checkpoint": round(ckpt["checkpoint_time"], 3),
+                      "restore": round(rest["restore_time"], 3),
+                      "timestamp": time.time()}
 
             if port:
                 healthy = _check_health(port, timeout=10)
@@ -212,12 +179,11 @@ def cmd_watch(args):
                 print(json.dumps(status), flush=True)
             else:
                 health_str = f" health={'OK' if status.get('healthy', True) else 'FAIL'}" if port else ""
-                print(f"Cycle {cycle_count}: ckpt={ckpt_time:.2f}s rest={rest_time:.2f}s{health_str}", flush=True)
+                print(f"Cycle {cycle_count}: ckpt={ckpt['checkpoint_time']:.2f}s rest={rest['restore_time']:.2f}s{health_str}", flush=True)
 
         except Exception as e:
             print(f"ERROR in cycle {cycle_count + 1}: {e}", file=sys.stderr)
 
-        # Sleep in small increments so SIGTERM is responsive
         for _ in range(int(interval)):
             if stop_event:
                 break
@@ -297,28 +263,27 @@ def cmd_recommend(args):
 
 
 def cmd_benchmark(args):
-    api = CudaCheckpointAPI()
     pids = discover_cuda_pids(_resolve_pid(args))
     print(f"CUDA PIDs: {pids} ({len(pids)} total)")
     if not pids:
         print("ERROR: No CUDA-active PIDs found", file=sys.stderr)
         sys.exit(1)
-    parallel = not args.sequential
+    mgpu = MultiGPUCheckpointer(pids, parallel=not args.sequential)
     cycles = []
     for i in range(args.cycles):
         print(f"\n--- Cycle {i+1}/{args.cycles} ---")
-        ckpt_time = _do_checkpoint(api, pids, parallel=parallel)
-        rest_time = _do_restore(api, pids, parallel=parallel)
-        cycle = {"checkpoint": ckpt_time, "restore": rest_time}
+        ckpt = mgpu.checkpoint()
+        rest = mgpu.restore()
+        cycle = {"checkpoint": ckpt["checkpoint_time"], "restore": rest["restore_time"]}
         if args.port and args.model:
             t0 = time.perf_counter()
             text = _query_server(args.port, "The capital of France is", args.model)
             infer_time = time.perf_counter() - t0
             cycle["inference"] = infer_time
-            cycle["cold_start"] = rest_time + infer_time
-            print(f"  Ckpt: {ckpt_time:.2f}s, Restore: {rest_time:.2f}s, Cold: {cycle['cold_start']:.2f}s")
+            cycle["cold_start"] = rest["restore_time"] + infer_time
+            print(f"  Ckpt: {ckpt['checkpoint_time']:.2f}s, Restore: {rest['restore_time']:.2f}s, Cold: {cycle['cold_start']:.2f}s")
         else:
-            print(f"  Ckpt: {ckpt_time:.2f}s, Restore: {rest_time:.2f}s")
+            print(f"  Ckpt: {ckpt['checkpoint_time']:.2f}s, Restore: {rest['restore_time']:.2f}s")
         cycles.append(cycle)
     avg_restore = sum(c["restore"] for c in cycles) / len(cycles)
     print(f"\nAvg restore: {avg_restore:.2f}s ({len(cycles)} cycles)")

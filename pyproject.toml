@@ -5,18 +5,18 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cuda-checkpoint-vllm"
 version = "0.1.0"
-description = "Eliminate vLLM cold start via NVIDIA cuda-checkpoint — 92-98% reduction across H100, A100, L4"
+description = "Multi-GPU CUDA checkpoint/restore — 92-98% cold start reduction. Generic core + vLLM integration."
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
-serve = ["httpx"]
+vllm = ["httpx"]
 dev = ["pytest>=8.0"]
 
 [project.scripts]
-vllm-ckpt = "vllm_cuda_ckpt.cli:main"
+vllm-ckpt = "cuda_checkpoint_vllm.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

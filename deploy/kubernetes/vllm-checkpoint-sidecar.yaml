@@ -16,7 +16,6 @@ spec:
     spec:
       shareProcessNamespace: true
       containers:
-        # Main vLLM serving container
         - name: vllm
           image: vllm/vllm-openai:latest
           command:
@@ -63,14 +62,13 @@ spec:
             initialDelaySeconds: 120
             periodSeconds: 30
 
-        # Checkpoint sidecar — runs vllm-ckpt watch
         - name: checkpoint-sidecar
           image: vllm/vllm-openai:latest
           command:
             - /bin/bash
             - -c
             - |
-              pip install cuda-checkpoint-vllm[serve] && \
+              pip install cuda-checkpoint-vllm[vllm] && \
               cd /opt && git clone --depth 1 https://github.com/NVIDIA/cuda-checkpoint.git && \
               export PATH=/opt/cuda-checkpoint/bin/x86_64_Linux:$PATH && \
               vllm-ckpt watch --port 8000 --interval 300 --json
