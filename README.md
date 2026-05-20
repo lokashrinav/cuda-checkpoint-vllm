@@ -1,18 +1,27 @@
 # cuda-checkpoint
 
-Python library for multi-GPU CUDA checkpoint/restore. Works with any CUDA process — vLLM, TensorRT-LLM, SGLang, PyTorch training, etc.
+NVIDIA's `cuda-checkpoint` works on single processes. Real GPU workloads — tensor parallelism, distributed training, multi-GPU inference — spawn multiple CUDA processes that must be checkpointed together. Lock all PIDs before checkpointing any, or NCCL deadlocks. This library solves that.
 
-Wraps NVIDIA's `cuCheckpointProcess*` driver API with parallel multi-PID orchestration that achieves **92-98% cold start reduction**.
-
-## What it does
-
-Suspends all GPU state (memory, CUDA graphs, contexts) to host memory and restores it later. The process stays alive — no serialization to disk, no model reloading.
+Suspends all GPU state (memory, CUDA graphs, contexts) to host memory and restores it later. The process stays alive — no serialization to disk, no model reloading. Works with any CUDA process: vLLM, TensorRT-LLM, SGLang, PyTorch training.
 
 ```
 Before checkpoint:  GPU memory = 25 GB (model + KV cache + graphs)
 After checkpoint:   GPU memory = 0 bytes (freed for other workloads)
 After restore:      GPU memory = 25 GB (everything back, ready to serve)
 ```
+
+## The multi-GPU problem
+
+NVIDIA provides `cuda-checkpoint` — a CLI that checkpoints a single CUDA process. But most GPU workloads aren't a single process:
+
+- **vLLM with TP=2**: 2 GPU worker processes + parent
+- **vLLM with TP=4**: 4 GPU workers + parent
+- **PyTorch DDP**: one process per GPU
+- **Any NCCL workload**: multiple processes with shared GPU-side communicator state
+
+You can't just checkpoint them one at a time. NCCL communicators create cross-process GPU state — if you checkpoint process A while process B is still running an allreduce, you deadlock. All processes must be locked before any are checkpointed.
+
+This library handles that: discovers all CUDA-active PIDs in a process tree, locks them all, then checkpoints/restores in parallel.
 
 ## Quick start
 
@@ -22,8 +31,8 @@ from cuda_checkpoint import CudaCheckpointAPI, MultiGPUCheckpointer, discover_cu
 # Single process
 api = CudaCheckpointAPI()
 api.lock(pid)
-api.checkpoint(pid)    # GPU memory → host memory
-api.restore(pid)       # host memory → GPU memory
+api.checkpoint(pid)    # GPU memory -> host memory
+api.restore(pid)       # host memory -> GPU memory
 api.unlock(pid)
 
 # Multi-GPU (parallel)
@@ -55,31 +64,11 @@ export NCCL_NVLS_ENABLE=0
 export NCCL_P2P_DISABLE=1
 ```
 
-## Architecture
-
-Two layers:
-
-### `cuda_checkpoint` — generic core
-
-| Module | What it does |
-|--------|-------------|
-| `api.py` | `CudaCheckpointAPI` — ctypes bindings to `cuCheckpointProcessLock/Checkpoint/Restore/Unlock` |
-| `multi_gpu.py` | `MultiGPUCheckpointer` — parallel checkpoint/restore across N PIDs via ThreadPoolExecutor |
-| `discover.py` | `discover_cuda_pids()` — walks process tree, probes each PID for CUDA activity |
-
-### `cuda_checkpoint_vllm` — vLLM integration (optional)
-
-| Module | What it does |
-|--------|-------------|
-| `orchestrator.py` | `VLLMCheckpointer` — sleep/wake optimization, V0/V1 engine detection |
-| `discovery.py` | `find_vllm_server()` — auto-discovers running `vllm serve` |
-| `cli.py` | `vllm-ckpt` CLI — discover, cycle, benchmark, watch (sidecar daemon), recommend |
-
-## Validated results
+## Results
 
 36 experiments across 3 GPU architectures, 9 configurations, 3 models. All tests on Modal with real hardware. Full details in [WRITEUP.md](WRITEUP.md).
 
-### vLLM multi-GPU (the main result)
+### Multi-GPU vLLM
 
 | Config | Model | GPU | TP | Startup | Cold Start | Reduction | Inference |
 |--------|-------|-----|-----|---------|-----------|-----------|-----------|
@@ -93,7 +82,7 @@ Two layers:
 | CUDA graphs | Qwen2-7B | A100 | 2 | 338.1s | 14.99s | 95.6% | 0.353s |
 | AWQ + CUDA graphs | Qwen2-7B-AWQ | H100 | 2 | 310.7s | 4.97s | 98.4% | 0.733s |
 
-### Stability and correctness
+### Stability
 
 - **10-cycle stability**: zero memory leaks, 3.22s avg restore, all outputs identical ([benchmark](benchmarks/vllm_10cycle_stability.py))
 - **Error recovery**: invalid PID, double checkpoint, double restore, rapid cycling — all handled safely ([benchmark](benchmarks/vllm_error_recovery.py))
@@ -116,6 +105,26 @@ Validated against raw PyTorch on T4 ([test](tests/modal_test_generic.py)):
 | A100 | No (enforce-eager) | 3.5s | CUDA graphs add 4x restore overhead on A100 |
 | L4 | No (enforce-eager) | 4.0s | Single GPU, inference 4.7x slower than H100 |
 
+## Architecture
+
+Two layers:
+
+### `cuda_checkpoint` -- generic core
+
+| Module | What it does |
+|--------|-------------|
+| `api.py` | `CudaCheckpointAPI` — ctypes bindings to the 4-step driver API (lock, checkpoint, restore, unlock) |
+| `multi_gpu.py` | `MultiGPUCheckpointer` — locks all PIDs first, then checkpoints/restores in parallel via ThreadPoolExecutor |
+| `discover.py` | `discover_cuda_pids()` — walks process tree, probes each PID for CUDA activity |
+
+### `cuda_checkpoint_vllm` -- vLLM integration (optional)
+
+| Module | What it does |
+|--------|-------------|
+| `orchestrator.py` | `VLLMCheckpointer` — sleep/wake optimization, V0/V1 engine detection |
+| `discovery.py` | `find_vllm_server()` — auto-discovers running `vllm serve` |
+| `cli.py` | `vllm-ckpt` CLI — discover, cycle, benchmark, watch (sidecar daemon), recommend |
+
 ## vLLM CLI
 
 ```bash
@@ -137,10 +146,10 @@ vllm-ckpt benchmark --port 8000 --model Qwen/Qwen2-7B --cycles 5
 Kubernetes and Docker Compose manifests in `deploy/`:
 
 ```bash
-# Kubernetes — vLLM + checkpoint sidecar
+# Kubernetes -- vLLM + checkpoint sidecar
 kubectl apply -f deploy/kubernetes/vllm-checkpoint-sidecar.yaml
 
-# Docker Compose — local dev
+# Docker Compose -- local dev
 docker compose -f deploy/docker-compose/docker-compose.yaml up
 ```
 
@@ -162,14 +171,6 @@ Reproducible Modal scripts in `benchmarks/`:
 ```bash
 modal run benchmarks/vllm_multi_gpu_tp2.py
 ```
-
-## Multi-GPU gap
-
-NVIDIA's `cuda-checkpoint` CLI works on single processes. Most GPU workloads (tensor parallelism, distributed training) spawn multiple CUDA processes. This library bridges that gap:
-
-1. **Multi-GPU support** — parallel checkpoint/restore across all CUDA PIDs in a process tree
-2. **43-73% faster restore** — ThreadPoolExecutor parallelism + optional sleep optimization
-3. **Framework-agnostic** — works with any CUDA process, not tied to a specific inference server
 
 ## License
 
